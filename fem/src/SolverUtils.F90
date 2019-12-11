@@ -9523,6 +9523,7 @@ END FUNCTION SearchNodeL
       DEALLOCATE(r)      
 
     CASE('norm')
+
       Change = ABS( Norm-PrevNorm )
       IF( .NOT. ConvergenceAbsolute .AND. Norm + PrevNorm > 0.0) THEN
         Change = Change * 2.0_dp/ (Norm+PrevNorm)
@@ -10557,7 +10558,127 @@ END FUNCTION SearchNodeL
   END FUNCTION CheckStepSize
 !------------------------------------------------------------------------------
 
+
+!------------------------------------------------------------------------------
+!> Apply Anderson acceleration to the solution of nonlinear system.
+!------------------------------------------------------------------------------
+  SUBROUTINE AndersonAcceleration(PreSolve, Solver, NoSolve ) 
+
+    LOGICAL :: PreSolve
+    TYPE(Solver_t), POINTER :: Solver
+    LOGICAL, OPTIONAL :: NoSolve
     
+    TYPE(Matrix_t), POINTER :: A
+    REAL(KIND=dp), POINTER CONTIG :: b(:),x(:)
+    INTEGER :: AndersonIter, AndersonCnt, iter, n, k
+    TYPE(Variable_t), POINTER :: iterV, Svar
+    REAL(KIND=dp), ALLOCATABLE :: Alphas(:),Residuals(:,:),Iterates(:,:), TmpVec(:) 
+    REAL(KIND=dp) :: Nrm
+    
+    SAVE Residuals, Iterates, TmpVec, Alphas, AndersonCnt, AndersonIter
+
+    IF( PreSolve ) THEN
+      CALL Info('AndersonAcceleration','Performing pre-solution steps',Level=8)
+    ELSE
+      CALL Info('AndersonAcceleration','Performing post-solution steps',Level=8)
+    END IF
+    
+    
+    A => Solver % Matrix
+    n = A % NumberOfRows
+    SVar => Solver % Variable
+    x => SVar % Values
+    b => A % RHS    
+    
+    iterV => VariableGet( Solver % Mesh % Variables, 'nonlin iter' )
+    iter = NINT(iterV % Values(1))
+    
+    IF( iter == 1 ) THEN
+      CALL Info('AndersonAcceleration','Allocating structures for solution history',Level=6)
+      AndersonIter = ListGetInteger( Solver % Values,&
+          'Nonlinear System Anderson Iterations',UnfoundFatal=.TRUE.)
+      AndersonCnt = 0
+      IF(.NOT. ALLOCATED( Residuals ) ) THEN
+        ALLOCATE( Residuals( n, AndersonIter ), Iterates( n, AndersonIter ), TmpVec(n), &
+            Alphas(AndersonIter) )
+      END IF
+      Residuals = 0.0_dp
+      Iterates = 0.0_dp
+    END IF
+
+    IF( PreSolve ) THEN           
+      IF(.NOT. PRESENT( NoSolve ) ) THEN
+        CALL Fatal('AndersonAcceleration','We are missing argument "NoSolve"')
+      END IF
+      NoSolve = .FALSE.
+      IF( AndersonCnt == 0 ) RETURN
+      
+      CALL MatrixVectorMultiply( A, x, TmpVec )
+      TmpVec = TmpVec - b
+      Residuals( :, AndersonCnt ) = TmpVec
+        
+      IF( AndersonCnt == AndersonIter ) THEN
+        CALL Info('AndersonAcceleration','Minimizing residual using history data',Level=6)
+        CALL AndersonMinimize( )
+
+        ! We add the nonlinear iteration as it is normally done in the solution phase.
+        ! We are not solving for x any more, as it was set otherwise.
+        iterV % Values = iterV % Values + 1
+        NoSolve = .TRUE.
+        AndersonCnt = 0
+      END IF
+    ELSE
+      AndersonCnt = AndersonCnt + 1
+      Iterates( :, AndersonCnt ) = x
+    END IF
+
+  CONTAINS 
+
+    SUBROUTINE AndersonMinimize()
+
+      IF( ParEnv % PEs > 1 ) THEN
+        CALL Warn('AndersonAcceleration','Not yet available in parallel!')
+      END IF
+      
+      ! If we are converged then the solution should already be the last component.
+      ! Hence use that as the basis. 
+      Alphas(AndersonIter) = 1.0_dp     
+      TmpVec = Residuals(:,AndersonIter )
+
+      ! Minimize the residual
+      DO k=AndersonIter-1,1,-1
+        Nrm = SQRT( SUM( Residuals(:,k)**2 ) ) 
+        Alphas(k) = -SUM(TmpVec*Residuals(:,k)) / Nrm**2
+        TmpVec = TmpVec + Alphas(k) * Residuals(:,k)
+      END DO
+
+      ! Normalize the coefficients such that the sum equals unity
+      Alphas = Alphas / SUM( Alphas ) 
+
+      IF( InfoActive(20) ) THEN
+        PRINT *,'Normalized Alphas:',Alphas
+      END IF
+
+      ! Create the new suggestion for the solution vector
+      x = 0.0_dp
+      DO k=1,AndersonIter
+        x = x + Alphas(k) * Iterates(:,k)
+      END DO
+
+      ! Calculate the L2 norms of the residual and solution
+      !Nrm = ComputeNorm(Solver, n, TmpVec )
+      !PRINT *,'Residual Norm:',Nrm
+
+      Nrm = ComputeNorm(Solver, n, x)
+      SVar % Norm = Nrm
+      
+    END SUBROUTINE AndersonMinimize
+    
+    
+  END SUBROUTINE AndersonAcceleration
+!------------------------------------------------------------------------------
+
+  
 
 !------------------------------------------------------------------------------
 !> Computing nodal weight may be good when one needs to transform nodal 
