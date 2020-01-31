@@ -10571,41 +10571,48 @@ END FUNCTION SearchNodeL
 !------------------------------------------------------------------------------
 !> Apply Anderson acceleration to the solution of nonlinear system.
 !------------------------------------------------------------------------------
-  SUBROUTINE AndersonAcceleration(PreSolve, Solver, NoSolve ) 
-
-    LOGICAL :: PreSolve
-    TYPE(Solver_t), POINTER :: Solver
-    LOGICAL, OPTIONAL :: NoSolve
-    
+  SUBROUTINE AndersonAcceleration(A,x,b,Solver,PreSolve,NoSolve)    
     TYPE(Matrix_t), POINTER :: A
-    REAL(KIND=dp), POINTER CONTIG :: b(:),x(:)
-    INTEGER :: AndersonIter, AndersonCnt, iter, n, k
+    REAL(KIND=dp) CONTIG :: b(:),x(:)
+    TYPE(Solver_t) :: Solver
+    LOGICAL :: PreSolve
+    LOGICAL, OPTIONAL :: NoSolve
+    !------------------------------------------------------------------------------
+    INTEGER :: AndersonIter, AndersonCnt, AndersonN, iter, n,i,j,k
     TYPE(Variable_t), POINTER :: iterV, Svar
-    REAL(KIND=dp), ALLOCATABLE :: Alphas(:),Residuals(:,:),Iterates(:,:), TmpVec(:) 
-    REAL(KIND=dp) :: Nrm
+    REAL(KIND=dp), ALLOCATABLE :: Alphas(:),Residuals(:,:),Iterates(:,:),AxTable(:,:),&
+        TmpVec(:) 
+    REAL(KIND=dp) :: Nrm, AndersonRelax
+    LOGICAL :: Found, DoRelax, Visited = .FALSE.    
+    INTEGER :: PrevSolverId = -1
     
-    SAVE Residuals, Iterates, TmpVec, Alphas, AndersonCnt, AndersonIter
-
+    SAVE Residuals, Iterates, TmpVec, Alphas, AndersonCnt, AndersonIter, PrevSolverId, &
+        AxTable, AndersonRelax, DoRelax, Visited
+        
     IF( PreSolve ) THEN
       CALL Info('AndersonAcceleration','Performing pre-solution steps',Level=8)
     ELSE
       CALL Info('AndersonAcceleration','Performing post-solution steps',Level=8)
     END IF
-    
-    
-    A => Solver % Matrix
-    n = A % NumberOfRows
-    SVar => Solver % Variable
-    x => SVar % Values
-    b => A % RHS    
-    
+
+    IF( ParEnv % PEs > 1 ) THEN
+      CALL Warn('AndersonAcceleration','Not yet available in parallel!')
+    END IF
+        
     iterV => VariableGet( Solver % Mesh % Variables, 'nonlin iter' )
     iter = NINT(iterV % Values(1))
+
+    IF(PRESENT(NoSolve)) NoSolve = .FALSE.
     
-    IF( iter == 1 ) THEN
+    n = A % NumberOfRows
+          
+    IF(.NOT. Visited ) THEN
+      PrevSolverId = Solver % SolverId
       CALL Info('AndersonAcceleration','Allocating structures for solution history',Level=6)
       AndersonIter = ListGetInteger( Solver % Values,&
           'Nonlinear System Anderson Iterations',UnfoundFatal=.TRUE.)
+      AndersonRelax = ListGetCReal( Solver % Values,&
+          'Nonlinear System Anderson Relaxation',DoRelax)
       AndersonCnt = 0
       IF(.NOT. ALLOCATED( Residuals ) ) THEN
         ALLOCATE( Residuals( n, AndersonIter ), Iterates( n, AndersonIter ), TmpVec(n), &
@@ -10613,76 +10620,161 @@ END FUNCTION SearchNodeL
       END IF
       Residuals = 0.0_dp
       Iterates = 0.0_dp
+      Visited = .TRUE.
     END IF
-
-    IF( PreSolve ) THEN           
-      IF(.NOT. PRESENT( NoSolve ) ) THEN
-        CALL Fatal('AndersonAcceleration','We are missing argument "NoSolve"')
-      END IF
-      NoSolve = .FALSE.
-      IF( AndersonCnt == 0 ) RETURN
+    
+    IF( PrevSolverId /= Solver % SolverId ) THEN
+      CALL Fatal('AndersonAcceleration','Current implementation only supports one solver!')
+    END IF
       
+    
+    IF( PreSolve ) THEN           
+      IF( iter == 1 ) AndersonCnt = 0
+      AndersonCnt = AndersonCnt + 1
+
+      ! Calculate the residual of the matrix equation
+      ! Here 'x' comes before being modified hence A(x) is consistent. 
       CALL MatrixVectorMultiply( A, x, TmpVec )
       TmpVec = TmpVec - b
-      Residuals( :, AndersonCnt ) = TmpVec
-        
-      IF( AndersonCnt == AndersonIter ) THEN
-        CALL Info('AndersonAcceleration','Minimizing residual using history data',Level=6)
-        CALL AndersonMinimize( )
 
-        ! We add the nonlinear iteration as it is normally done in the solution phase.
-        ! We are not solving for x any more, as it was set otherwise.
-        iterV % Values = iterV % Values + 1
-        NoSolve = .TRUE.
+      ! We collect the base until it reaches the maximum size.
+      ! Then we start to forget starting from the oldest. 
+      IF( AndersonCnt <= AndersonIter ) THEN
+        AndersonN = AndersonCnt
+      ELSE
+        AndersonN = AndersonIter
+        DO i=1,AndersonIter-1
+          Residuals( :, i ) = Residuals( :, i+1 )
+          Iterates( :, i ) = Iterates( :, i+1 )
+        END DO
+      END IF
+      Residuals( :, AndersonN ) = TmpVec
+      Iterates( :, AndersonN ) = x
+
+      ! Pure Anderson sweep is done after we have full basis.
+      ! Then start to populate the basis again. 
+      IF(.NOT. DoRelax .AND. AndersonCnt == AndersonIter ) THEN
+        CALL AndersonMinimize( )
         AndersonCnt = 0
+        IF(PRESENT(NoSolve)) NoSolve = .TRUE.
+        RETURN
+      END IF
+      
+      IF( ListGetLogical( Solver % Values,&
+          'Nonlinear System Anderson Guess',Found ) ) THEN
+        CALL AndersonGuess()
       END IF
     ELSE
-      AndersonCnt = AndersonCnt + 1
-      Iterates( :, AndersonCnt ) = x
+      ! Relaxation strategy is done after each linear solve.
+      IF( DoRelax ) THEN
+        AndersonN = MIN( AndersonCnt, AndersonIter ) 
+        CALL Info('AndersonAcceleration','Minimizing residual using history data',Level=6)
+        CALL AndersonMinimize( )
+      END IF
     END IF
 
   CONTAINS 
 
     SUBROUTINE AndersonMinimize()
+      INTEGER ::m, AndersonMinn
 
-      IF( ParEnv % PEs > 1 ) THEN
-        CALL Warn('AndersonAcceleration','Not yet available in parallel!')
+      m = AndersonN
+      AndersonMinN = ListGetInteger( Solver % Values,&
+          'Nonlinear System Anderson Start',Found )
+      IF(.NOT. (Found .OR. DoRelax)) AndersonMinN = AndersonIter
+      
+      PRINT *,'Alphas0:',iter,AndersonN,AndersonIter,AndersonCnt
+      
+      ! Nothing to do 
+      IF( m < AndersonMinN ) RETURN
+
+      ! If size of our basis is just one, there is not much to do...
+      ! We can only perform classical relaxation. 
+      IF( m == 1 ) THEN
+        x = AndersonRelax * x + (1-AndersonRelax) * Iterates(:,1)
+        RETURN
       END IF
       
       ! If we are converged then the solution should already be the last component.
       ! Hence use that as the basis. 
-      Alphas(AndersonIter) = 1.0_dp     
-      TmpVec = Residuals(:,AndersonIter )
-
+      Alphas(m) = 1.0_dp     
+      TmpVec = Residuals(:,m)
+      
       ! Minimize the residual
-      DO k=AndersonIter-1,1,-1
+      DO k=m-1,1,-1
         Nrm = SQRT( SUM( Residuals(:,k)**2 ) ) 
         Alphas(k) = -SUM(TmpVec*Residuals(:,k)) / Nrm**2
         TmpVec = TmpVec + Alphas(k) * Residuals(:,k)
       END DO
 
       ! Normalize the coefficients such that the sum equals unity
-      Alphas = Alphas / SUM( Alphas ) 
+      Alphas = Alphas / SUM( Alphas(1:m) )
 
-      IF( InfoActive(20) ) THEN
-        PRINT *,'Normalized Alphas:',Alphas
-      END IF
+!      IF( InfoActive(20) ) THEN
+      PRINT *,'Alphas1:',AndersonRelax,SUM(Alphas(1:m)),SUM(ABS(Alphas(1:m)))
+      PRINT *,'Alphas2:',Alphas(1:m)
+!      END IF
 
+      
       ! Create the new suggestion for the solution vector
-      x = 0.0_dp
-      DO k=1,AndersonIter
-        x = x + Alphas(k) * Iterates(:,k)
+      ! We take part of the suggested new solution vector 'x' and
+      ! part of minimized residual that was used in anderson acceleration.
+      IF( DoRelax ) THEN
+        Alphas = Alphas * (1-AndersonRelax)
+        x = AndersonRelax * x
+        DO k=1,m
+          x = x + Alphas(k) * Iterates(:,k)
+        END DO
+      ELSE
+        x = Alphas(m) * Iterates(:,m)
+        DO k=1,m-1
+          x = x + Alphas(k) * Iterates(:,k)
+        END DO
+      END IF
+        
+    END SUBROUTINE AndersonMinimize
+
+
+
+    SUBROUTINE AndersonGuess()
+      INTEGER :: AndersonMinN
+
+      REAL(KIND=dp), POINTER, SAVE :: AxTable(:,:), Dvec(:), Ymat(:,:)
+      LOGICAL, SAVE :: AllocationsDone = .FALSE.
+      INTEGER :: i,j,m
+      
+      IF(.NOT. AllocationsDone ) THEN
+        m = AndersonIter
+        ALLOCATE(AxTable(n,m),Dvec(m),Ymat(m,m))
+        AllocationsDone = .TRUE.
+      END IF
+      
+      m = AndersonN      
+      ! Calculate the residual of the matrix equation
+      DO i=1,m
+        CALL MatrixVectorMultiply( A, Iterates(:,i), TmpVec )
+        AxTable(:,i) = TmpVec
       END DO
 
-      ! Calculate the L2 norms of the residual and solution
-      !Nrm = ComputeNorm(Solver, n, TmpVec )
-      !PRINT *,'Residual Norm:',Nrm
-
-      Nrm = ComputeNorm(Solver, n, x)
-      SVar % Norm = Nrm
+      DO i=1,m
+        DO j=i,m
+          Ymat(i,j) = SUM( AxTable(:,i) * AxTable(:,j) )
+          Ymat(j,i) = Ymat(i,j)
+        END DO
+        Dvec(i) = SUM( AxTable(:,i) * b )
+      END DO
       
-    END SUBROUTINE AndersonMinimize
-    
+      CALL LUSolve(m, YMat(1:m,1:m), Dvec(1:m) )
+
+      PRINT *,'Alphas3:',iter,SUM(DVec(1:m)),SUM(ABS(Dvec(1:m)))
+      PRINT *,'Alphas4:',iter,DVec(1:m)
+      
+      x = Dvec(m) * Iterates(:,m)
+      DO i=1,m-1
+        x = x + Dvec(i) * Iterates(:,i)
+      END DO
+
+    END SUBROUTINE AndersonGuess
     
   END SUBROUTINE AndersonAcceleration
 !------------------------------------------------------------------------------
@@ -12355,7 +12447,7 @@ END FUNCTION SearchNodeL
     TYPE(Matrix_t), POINTER :: Aaid, Projector, MP
     REAL(KIND=dp), POINTER :: mx(:), mb(:), mr(:)
     TYPE(Variable_t), POINTER :: IterV
-    LOGICAL :: NormalizeToUnity
+    LOGICAL :: NormalizeToUnity, AndersonAcc, AndersonScaled, NoSolve
     
     INTERFACE 
        SUBROUTINE VankaCreate(A,Solver)
@@ -12599,10 +12691,16 @@ END FUNCTION SearchNodeL
       RETURN
     END IF
 
-! 
+    AndersonAcc = ListGetLogical( Params,'Nonlinear System Anderson Acceleration',GotIt ) 
+    AndersonScaled = ListgetLogical( Params,'Nonlinear System Anderson Scaled',GotIt ) 
+
+    IF( AndersonAcc .AND. .NOT. AndersonScaled ) THEN
+      CALL AndersonAcceleration( A, x, b, Solver, .TRUE., NoSolve )
+      IF(NoSolve) GOTO 120
+    END IF
+    
 !   Convert rhs & initial value to the scaled system:
 !   -------------------------------------------------
-
     IF ( ScaleSystem ) THEN
       ApplyRowEquilibration = ListGetLogical(Params,'Linear System Row Equilibration',GotIt)
       IF ( ApplyRowEquilibration ) THEN
@@ -12623,6 +12721,11 @@ END FUNCTION SearchNodeL
        CALL RotateNTSystemAll(NonlinVals, Solver % Variable % Perm, DOFs)
     END IF
 
+    IF( AndersonAcc .AND. AndersonScaled ) THEN
+      CALL AndersonAcceleration( A, x, b, Solver, .TRUE., NoSolve )
+      IF( NoSolve ) GOTO 110
+    END IF
+    
     ! Sometimes the r.h.s. may abruptly diminish in value resulting to significant 
     ! convergence issues or it may be that the system scales linearly with the source. 
     ! This flag tries to improve on the initial guess of the linear solvers, and may 
@@ -12714,6 +12817,10 @@ END FUNCTION SearchNodeL
       END SELECT
     END IF
 
+110 IF( AndersonAcc .AND. AndersonScaled )  THEN
+      CALL AndersonAcceleration( A, x, b, Solver, .FALSE.)
+    END IF
+    
     IF(ComputeChangeScaled) THEN
       CALL ComputeChange(Solver,.FALSE.,n, x, NonlinVals, Matrix=A, RHS=b )
       DEALLOCATE(NonlinVals)
@@ -12727,6 +12834,10 @@ END FUNCTION SearchNodeL
       END IF
     END IF
 
+120 IF( AndersonAcc .AND. .NOT. AndersonScaled )  THEN
+      CALL AndersonAcceleration( A, x, b, Solver, .FALSE.)
+    END IF
+    
     Aaid => A
     IF (PRESENT(BulkMatrix)) THEN
       IF (ASSOCIATED(BulkMatrix) ) Aaid=>BulkMatrix

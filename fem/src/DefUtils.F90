@@ -3190,7 +3190,7 @@ CONTAINS
     TYPE(Matrix_t), POINTER :: Ctmp
     CHARACTER(LEN=MAX_NAME_LEN) :: linsolver, precond, dumpfile, saveslot
     INTEGER :: NameSpaceI, Count, MaxCount, i
-    LOGICAL :: LinearSystemTrialing, AndersonAcc, AndersonMin
+    LOGICAL :: LinearSystemTrialing
 
     CALL Info('DefaultSolve','Solving linear system with default routines',Level=10)
     
@@ -3257,17 +3257,9 @@ CONTAINS
           MINVAL( A % Values ), MAXVAL( A % Values ), SUM( A % Values ), SUM( ABS(A % Values) )
     END IF
 
-
-    AndersonAcc = ListGetLogical( Params,'Nonlinear System Anderson Acceleration',Found ) 
-
-    IF( AndersonAcc ) THEN      
-      CALL AndersonAcceleration( .TRUE., Solver, AndersonMin )
-      IF( AndersonMin ) GOTO 20
-    END IF
-       
     
 10  CONTINUE
-    
+
     CALL SolveSystem(A,ParMatrix,b,SOL,x % Norm,x % DOFs,Solver)
     
     IF( InfoActive( 20 ) ) THEN
@@ -3303,28 +3295,24 @@ CONTAINS
         CALL ListPopNamespace()
         CALL Info('DefaultSolve','Linear system namespace number: '//TRIM(I2S(NameSpaceI)),Level=7)
         CALL ListPushNamespace('linsys'//TRIM(I2S(NameSpaceI))//':')
-        GOTO 10 
+        GOTO 10
       END IF
     END IF
     
+
     IF ( ListGetLogical( Params,'Linear System Save',Found )) THEN
       saveslot = GetString( Params,'Linear System Save Slot', Found )
       IF( Found .AND. TRIM( saveslot ) == 'after') THEN
         CALL SaveLinearSystem( Solver ) 
       END IF
     END IF
+
     
     ! If flux corrected transport is used then apply the corrector to the system
     IF( GetLogical( Params,'Linear System FCT',Found ) ) THEN
       CALL FCT_Correction( Solver )
     END IF
 
-    IF( AndersonAcc ) THEN      
-      CALL AndersonAcceleration( .FALSE., Solver )
-    END IF
-
-20  CONTINUE 
-    
     IF( ListGetLogical( Params,'Harmonic Mode',Found ) ) THEN
       CALL ChangeToHarmonicSystem( Solver, .TRUE. )
     END IF
