@@ -67,6 +67,7 @@ SUBROUTINE StructuredMeshMapper( Model,Solver,dt,Transient )
 
   USE CoordinateSystems
   USE MeshUtils
+  USE ParallelUtils
   USE DefUtils
 
   IMPLICIT NONE
@@ -90,7 +91,7 @@ SUBROUTINE StructuredMeshMapper( Model,Solver,dt,Transient )
        DisplacementMode, MaskExists, GotVeloVar, GotUpdateVar, Tangled,&
        DeTangle, ComputeTangledMask = .FALSE., Reinitialize, &
        MidLayerExists, WriteMappedMeshToDisk = .FALSE., GotBaseVar, &
-       BaseDisplaceFirst, RecompStab, MapHeight
+       BaseDisplaceFirst, RecompStab, MapHeight, BotProj
   REAL(KIND=dp) :: UnitVector(3),x0loc,x0bot,x0top,x0mid,xloc,wtop,BotVal,TopVal,&
        TopVal0, BotVal0, MidVal, RefVal, ElemVector(3),DotPro,Eps,Length, MinHeight
   REAL(KIND=dp) :: at0,at1,at2,dx
@@ -136,6 +137,9 @@ SUBROUTINE StructuredMeshMapper( Model,Solver,dt,Transient )
   FixedLayers => ListGetIntegerArray( SolverParams,'Fixed Layer Indexes',MultiLayer)
   NumberOfFixedLayers = SIZE( FixedLayers )
 
+  BotProj = ListGetLogical(SolverParams,'Project To Bottom',Found ) 
+
+  
   IF( (.NOT. Initialized) .OR. Reinitialize ) THEN
     IF(ASSOCIATED(BotPointer)) DEALLOCATE(BotPointer)
     IF(ASSOCIATED(TopPointer)) DEALLOCATE(TopPointer)
@@ -148,6 +152,18 @@ SUBROUTINE StructuredMeshMapper( Model,Solver,dt,Transient )
           UpNodePointer = UpPointer, DownNodePointer = DownPointer, &
           NumberOfLayers = NumberOfLayers, NodeLayer = NodeLayer )
       NumberOfLayers = NumberOfLayers + 1
+      
+      i = FixedLayers(1) 
+      IF( i /= 1 ) THEN
+        CALL Warn(Caller,'Enforcing first fixed layer to: 1 (was '//TRIM(I2S(i))//')')
+        FixedLayers(1) = 1
+      END IF
+      i = FixedLayers(NumberOfFixedLayers)
+      IF( i /= NumberOfLayers ) THEN
+        CALL Warn(Caller,'Enforcing last fixed layer to: '&
+            //TRIM(I2S(NumberOfLayers))//' (was '//TRIM(I2S(i))//')')
+        FixedLayers(NumberOfFixedLayers) = NumberOfLayers
+      END IF
     ELSE
       CALL DetectExtrudedStructure( Mesh, PSolver, ExtVar = Var, &
           TopNodePointer = TopPointer, BotNodePointer = BotPointer, &
@@ -642,12 +658,18 @@ CONTAINS
 
   
   SUBROUTINE MultiLayerMapper()
-    REAL(KIND=dp), ALLOCATABLE :: Proj(:,:), StrideCoord(:),FixedCoord(:)
+    REAL(KIND=dp), ALLOCATABLE :: Proj(:,:), StrideCoord(:),FixedCoord(:),OrigStride(:)
     INTEGER, ALLOCATABLE :: StrideInd(:),StridePerm(:)
-    LOGICAL :: Hit, Debug 
+    INTEGER :: ierr, PEs
+    LOGICAL :: Hit, Debug, ProjDone = .FALSE. 
     REAL(KIND=dp) :: q
-    TYPE(Variable_t), POINTER :: FixedVar
+    TYPE(Variable_t), POINTER :: FixedVar    
+    INTEGER :: status(MPI_STATUS_SIZE)
 
+    
+    SAVE :: ProjDone, Proj, StrideCoord, FixedCoord, StridePerm, OrigStride, StrideInd
+
+    
     ! Get the new mapping using linear interpolation from bottom and top
     !-------------------------------------------------------------------
     CALL Info(Caller,'Mapping using '//TRIM(I2S(NumberOfFixedLayers))//' fixed layers',Level=6)
@@ -656,14 +678,7 @@ CONTAINS
       CALL Fatal(Caller,'Mask not available yet for multiple layers!')
     END IF
     
-    i = FixedLayers(1)
-    IF( i /= 1 ) THEN
-      CALL Fatal(Caller,'First layer should be one, not: '//TRIM(I2S(i)))
-    END IF
-    i = FixedLayers(NumberOfFixedLayers)
-    IF( i /= NumberOfLayers ) THEN
-      CALL Fatal(Caller,'Last layer should be '//TRIM(I2S(NumberOfLayers))//', not: '//TRIM(I2S(i)))
-    END IF
+    DeTangle = GetLogical(SolverParams,'Correct Surface',GotIt )
 
     VarName = ListGetString( SolverParams,'Fixed Layer Variable',UnfoundFatal = .TRUE. )
     FixedVar => VariableGet( Mesh % Variables, VarName ) 
@@ -674,14 +689,59 @@ CONTAINS
       CALL Fatal(Caller,'Invalid number of components in fixed layer variable:'&
           //TRIM(I2S(FixedVar % Dofs)))
     END IF
+
+    IF(.NOT. ProjDone ) THEN
+      ALLOCATE( Proj(NumberOfLayers,NumberOfFixedLayers),StrideInd(NumberOfLayers),&
+          StridePerm(NumberOfLayers),StrideCoord(NumberOfLayers),&
+          FixedCoord(NumberOfFixedLayers),OrigStride(NumberOfLayers))
+      Proj = 0.0_dp
+      
+      Debug = .FALSE.
     
-    ALLOCATE( Proj(NumberOfLayers,NumberOfFixedLayers),StrideInd(NumberOfLayers),&
-        StridePerm(NumberOfLayers),StrideCoord(NumberOfLayers),FixedCoord(NumberOfFixedLayers))
-    Proj = 0.0_dp
+      ! Create the projection matrix used for all strides!
+      
+      ! Define a representative 1D stride from the Original coordinates.
+      ! Note that we assume that the mesh refinement strategy is the same everywhere. 
+      DO i=1,nnodes
+        ibot = BotPointer(i)
 
-    Debug = .FALSE.
+        ! Start mapping from bottom
+        IF( ibot /= i ) CYCLE
 
-    ! Create the projection matrix used for all strides!
+        j = ibot
+        StrideCoord(1) = OrigCoord(j)
+        DO k = 2,NumberOfLayers
+          j = UpPointer(j)
+          StrideCoord(k) = OrigCoord(j)
+        END DO
+
+        IF( Debug ) THEN
+          PRINT *,'StrideCoord0:',StrideCoord
+        END IF
+
+        EXIT
+      END DO
+
+      ! Use the same projection matrix in every slot
+      PEs = ParEnv % PEs 
+      IF( PEs > 1 ) THEN
+        CALL Info(Caller,'Communicating stride from 0 to all',Level=8)
+        IF( ParEnv % MyPe == 0 ) THEN
+          DO i=2,PEs                
+            CALL MPI_BSEND( StrideCoord,NumberOfLayers,MPI_DOUBLE_PRECISION,i-1,1301,ELMER_COMM_WORLD,ierr )
+          END DO
+        ELSE
+          CALL MPI_RECV( StrideCoord,NumberOfLayers,MPI_DOUBLE_PRECISION,0,1301,ELMER_COMM_WORLD,status,ierr )   
+        END IF
+        CALL MPI_BARRIER(ELMER_COMM_WORLD,ierr)
+        CALL Info(Caller,'Done Communicating stride',Level=15)
+      END IF
+
+      ProjDone = .TRUE.
+    END IF
+    
+      
+    ! Now create a projection matrix for a single stride so that our mapping will be fast
     j = 1    
     DO i = 1, NumberOfLayers
       Hit = .FALSE.
@@ -691,7 +751,9 @@ CONTAINS
           IF( Debug ) PRINT *,'Proj('//TRIM(I2S(i))//','//TRIM(I2S(j))//')=',Proj(i,j)
           Hit = .TRUE.
         ELSE IF( FixedLayers(j) < i .AND. FixedLayers(j+1) > i ) THEN
-          q = 1.0_dp*(i-FixedLayers(j)) / (FixedLayers(j+1)-FixedLayers(j))
+          !q = 1.0_dp*(i-FixedLayers(j)) / (FixedLayers(j+1)-FixedLayers(j))
+          q = 1.0_dp*(StrideCoord(i)-StrideCoord(FixedLayers(j))) / &
+              (StrideCoord(FixedLayers(j+1))-StrideCoord(FixedLayers(j)))
           Proj(i,j+1) = q
           Proj(i,j) = 1-q
           IF( Debug ) THEN
@@ -708,7 +770,7 @@ CONTAINS
     END DO
     
 
-    ! Go through all 1D strides
+    ! Go through all 1D strides and perform mapping for mesh
     DO i=1,nnodes
       ibot = BotPointer(i)
 
@@ -745,13 +807,24 @@ CONTAINS
       END IF
 
       ! Fix mesh if it becomes tangled
-      IF( ANY( StrideCoord(2:NumberOfLayers)-StrideCoord(1:NumberOfLayers-1) < MinHeight ) ) THEN
-        TangledCount = TangledCount + 1
-        DO k = 2,NumberOfLayers
-          StrideCoord(k) = MAX( StrideCoord(k), StrideCoord(k-1)+MinHeight )
-        END DO
+      IF( DeTangle ) THEN
+        IF( BotProj ) THEN
+          IF( ANY( StrideCoord(1:NumberOfLayers-1)-StrideCoord(2:NumberOfLayers) < MinHeight ) ) THEN
+            TangledCount = TangledCount + 1
+            DO k = 2,NumberOfLayers
+              StrideCoord(k) = MIN( StrideCoord(k), StrideCoord(k-1)-MinHeight )
+            END DO
+          END IF
+        ELSE
+          IF( ANY( StrideCoord(2:NumberOfLayers)-StrideCoord(1:NumberOfLayers-1) < MinHeight ) ) THEN
+            TangledCount = TangledCount + 1
+            DO k = 2,NumberOfLayers
+              StrideCoord(k) = MAX( StrideCoord(k), StrideCoord(k-1)+MinHeight )
+            END DO
+          END IF
+        END IF
       END IF
-      
+        
       IF( Debug ) THEN
         PRINT *,'FixedCoord:',FixedCoord
         PRINT *,'StrideCoord:',StrideCoord
@@ -773,8 +846,7 @@ CONTAINS
         END WHERE
       END IF
       
-      Debug = .FALSE.
-      
+      Debug = .FALSE.      
     END DO
 
     CALL Info('StructureMeshMapper','Finished multilayer mapping',Level=8)

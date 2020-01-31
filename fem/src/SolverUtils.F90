@@ -2119,7 +2119,7 @@ CONTAINS
      INTEGER :: ConservativeAfterIters, ActiveDirection, NonlinIter, CoupledIter
      LOGICAL :: ConservativeAdd, ConservativeRemove, &
          DoAdd, DoRemove, DirectionActive, Rotated, FlatProjector, PlaneProjector, &
-         RotationalProjector, FirstTime = .TRUE., &
+         RotationalProjector, NormalProjector, FirstTime = .TRUE., &
          AnyRotatedContact, ThisRotatedContact, StickContact, TieContact, FrictionContact, SlipContact, &
          CalculateVelocity, NodalNormal, ResidualMode, AddDiag, SkipFriction, DoIt
      TYPE(MortarBC_t), POINTER :: MortarBC
@@ -2237,7 +2237,8 @@ CONTAINS
        PlaneProjector = ListGetLogical( BC, 'Plane Projector',Found )
        RotationalProjector = ListGetLogical( BC, 'Rotational Projector',Found ) .OR. &
            ListGetLogical( BC, 'Cylindrical Projector',Found )
-
+       NormalProjector = ListGetLogical( BC, 'Normal Projector',Found )
+       
        ! Is the current boundary rotated or not
        ThisRotatedContact = ListGetLogical( BC,'Normal-Tangential '//TRIM(VarName),Found)
 
@@ -2257,10 +2258,10 @@ CONTAINS
            END DO
            CALL Info('DetermineContact','Active direction set to: '//TRIM(I2S(ActiveDirection)))
          END IF
-       ELSE IF( RotationalProjector ) THEN
+       ELSE IF( RotationalProjector .OR. NormalProjector ) THEN
          ActiveDirection = 1
          IF( .NOT. ThisRotatedContact ) THEN
-           CALL Warn('DetermineContact','Rotational projector may not work without N-T coordinates')
+           CALL Warn('DetermineContact','Rotational and normal projectors should only work with N-T coordinates!')
          END IF
        ELSE
          CALL Fatal('DetermineContact','Projector must be current either flat, plane, cylinder or rotational!')
@@ -8409,11 +8410,16 @@ END FUNCTION SearchNodeL
        END IF
 
        IF ( .NOT.GotIt ) THEN
-         CALL Warn( 'InitializeTimestep', &
+         IF (Solver % TimeOrder > 1) THEN
+           Method = 'bossak'
+           Solver % Beta = 1.0d0
+         ELSE
+           CALL Warn( 'InitializeTimestep', &
                'Timestepping method defaulted to IMPLICIT EULER' )
 
-         Solver % Beta = 1.0D0
-         Method = 'implicit euler'
+           Solver % Beta = 1.0D0
+           Method = 'implicit euler'
+         END IF
        END IF
 
      ELSE
@@ -8458,6 +8464,9 @@ END FUNCTION SearchNodeL
              WRITE( Message, * ) 'Invalid order BDF ',  Solver % Order
              CALL Fatal( 'InitializeTimestep', Message )
            END IF
+
+         CASE('bossak')
+           Solver % Beta = 1.0d0
 
          CASE DEFAULT 
            WRITE( Message, * ) 'Unknown timestepping method: ',Method

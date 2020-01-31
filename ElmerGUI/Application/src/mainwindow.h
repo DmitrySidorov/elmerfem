@@ -69,6 +69,8 @@
 #include "operation.h"
 #include "materiallibrary.h"
 #include "twod/twodview.h"
+#include "solverlogwindow.h"
+#include "objectbrowser.h"
 
 #ifdef EG_QWT
 #include "convergenceview.h"
@@ -94,6 +96,8 @@ class VtkPost;
 class MainWindow : public QMainWindow
 {
   Q_OBJECT
+  
+  friend class ObjectBrowser;
     
 public:
   MainWindow();
@@ -103,10 +107,12 @@ public:
   
   QVariant settings_value(const QString & key, const QVariant & defaultValue = QVariant()) const;
   void settings_setValue(const QString & key, const QVariant & value);
+  void saveAndRun(bool generateSif);
   
 protected:
   void contextMenuEvent(QContextMenuEvent *event);
-
+  void closeEvent(QCloseEvent *event);
+  
 private slots:
   // menu slots:
   void openSlot();                // File -> Open...
@@ -173,6 +179,7 @@ private slots:
   void showTwodViewSlot();        // View -> Show 2D view...
   void showVtkPostSlot();         // View -> Show VTK post processor...
   void showParaViewSlot();        // View -> Use ParaView for postprocessing
+  void showObjectBrowserSlot();   // view -> Show Object Browser 
   void parallelSettingsSlot();    // Solver -> Parallel settings
   void runsolverSlot();           // Solver -> Run solver
   void killsolverSlot();          // Solver -> Kill solver
@@ -181,6 +188,7 @@ private slots:
   void killresultsSlot();         // Solver -> Kill post process
   void compileSolverSlot();       // Solver -> Compile...
   void showaboutSlot();           // Help -> About...
+  void generateAndSaveAndRunSlot();
 
   // other private slots:
   void meshingStartedSlot();          // signal emitted by meshingThread
@@ -244,11 +252,11 @@ private slots:
 
   void menuBarTriggeredSlot(QAction*);
   
-  void loadRecentProject0();
-  void loadRecentProject1();
-  void loadRecentProject2();
-  void loadRecentProject3();
-  void loadRecentProject4(); 
+  void loadRecentProject0Slot();
+  void loadRecentProject1Slot();
+  void loadRecentProject2Slot();
+  void loadRecentProject3Slot();
+  void loadRecentProject4Slot(); 
 
 private:
   // widgets and helpers:
@@ -258,7 +266,7 @@ private:
   BoundaryDivide *boundaryDivide; // boundary division control
   Meshutils *meshutils;           // mesh manipulation utilities  
   MeshingThread *meshingThread;   // meshing thread
-  SifWindow *solverLogWindow;     // Solver log
+  SolverLogWindow *solverLogWindow;     // Solver log
   SifGenerator *sifGenerator;     // SIF generator
   EdfEditor *edfEditor;           // Edf editor
 #ifdef EG_QWT
@@ -276,6 +284,7 @@ private:
   void loadProjectContents(QDomElement, QVector<DynamicEditor*>&, QString);
   QString getDefaultDirName();
   void loadProject(QString);
+  bool saveProject(QString);  
   void loadSettings();
   void saveSettings();
   bool loadExtraSolver(QString); // load the solver with specified solver name, Nov 2019 by TS
@@ -309,6 +318,11 @@ private:
   QAction *openAct;               // File -> Open...
   QAction *loadAct;               // File -> Load...
   QAction *loadProjectAct;        // File -> Load project....
+  QAction *recentProject0Act;
+  QAction *recentProject1Act;
+  QAction *recentProject2Act;
+  QAction *recentProject3Act;
+  QAction *recentProject4Act;
   QAction *saveAct;               // File -> Save...
   QAction *saveAsAct;             // File -> Save As...
   QAction *saveProjectAct;        // File -> Save project...
@@ -360,6 +374,7 @@ private:
   QAction *showCadModelAct;       // View -> Show cad model...
   QAction *showTwodViewAct;       // View -> Show 2d view...
   QAction *showVtkPostAct;        // View -> Show VTK post processor...
+  QAction *showObjectBrowserAct;  // View -> Show Object Browser
   QAction *meshcontrolAct;        // Mesh -> Control...
   QAction *remeshAct;             // Mesh -> Remesh
   QAction *stopMeshingAct;        // Mesh -> Kill generator
@@ -377,6 +392,7 @@ private:
   QAction *paraviewAct;           // Solver -> Launch Paraview
   QAction *compileSolverAct;      // Solver -> Compile...
   QAction *aboutAct;              // Help -> About...
+  QAction *generateAndSaveAndRunAct;
 
   // property editors etc:
   GeneralSetup *generalSetup;
@@ -506,6 +522,13 @@ private:
   // variables and functions for "Recent projects..." menu
   QStringList recentProject;
  	void addRecentProject(QString, bool);  
+ 	
+ 	// String to store current project dir for "generate, save and run" button
+ 	QString currentProjectDirName;
+ 	
+ 	bool suppressAutoSifGeneration;
+ 	
+ 	ObjectBrowser* objectBrowser;
 };
 
 #endif // MAINWINDOW_H
